@@ -10,12 +10,16 @@ class ExerciseConfig:
     min_rom: float
     min_hold_top_ms: int = 150
     min_hold_bottom_ms: int = 150
+    type: str = "single"   # 👈 ADD THIS
+
 
 
 EXERCISE_CATALOG = {
     "squat": ExerciseConfig("squat", "left_knee", "decrease_then_increase", 35, 200, 200),
     "pushup": ExerciseConfig("pushup", "left_elbow", "decrease_then_increase", 30, 150, 150),
     "bicep_curl": ExerciseConfig("bicep_curl", "left_elbow", "decrease_then_increase", 40, 150, 150),
+    "boxing": ExerciseConfig("boxing", "right_elbow", "", 0, type="boxing"),
+    "yoga": ExerciseConfig("yoga", "left_knee", "", 0, type="yoga"),
 }
 
 

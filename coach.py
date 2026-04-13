@@ -1,239 +1,345 @@
-import time, math, cv2, json, os
+import time
+import json
+import cv2
 import numpy as np
+import socket
+import struct
+from collections import deque
+
 from utils import PoseEstimator
-from socket_video import SocketVideoClient
+from audio_feedback import AudioFeedback
+from fsm import SingleExerciseFSM, YogaFSM, BoxingFSM
+
+FPS = 30
+HOST = "0.0.0.0"
+PORT = 5000
+
+JOINTS = {
+    "left_elbow": (11, 13, 15),
+    "right_elbow": (12, 14, 16),
+    "left_knee": (23, 25, 27),
+    "right_knee": (24, 26, 28),
+    "left_shoulder": (13, 11, 23),
+    "right_shoulder": (14, 12, 24),
+}
 
 
-#   ANGLE CALCULATION
-def calc_angle(a, b, c):
-    """Calculates angle at point b between a-b-c (0–180 degrees)."""
-    a, b, c = map(lambda p: np.array(p, dtype=float), (a, b, c))
+LOWER_BODY_JOINTS = ["left_knee", "right_knee"]
+UPPER_BODY_JOINTS = ["left_elbow", "right_elbow", "left_shoulder", "right_shoulder"]
 
+
+POSE_CONNECTIONS = [
+    (11, 13), (13, 15), (15, 17),
+    (12, 14), (14, 16), (16, 18),
+    (11, 12),
+    (23, 25), (25, 27),
+    (24, 26), (26, 28),
+    (23, 24),
+    (11, 23), (12, 24)
+]
+
+
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
     ba = a - b
     bc = c - b
-    denom = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-8
-    cosv = np.dot(ba, bc) / denom
-    angle = np.degrees(np.arccos(np.clip(cosv, -1.0, 1.0)))
+    return np.degrees(
+        np.arccos(
+            np.clip(
+                np.dot(ba, bc) /
+                (np.linalg.norm(ba) * np.linalg.norm(bc)),
+                -1.0, 1.0
+            )
+        )
+    )
 
-    return float(angle)
+
+def draw_avatar_frame(landmarks, w, h):
+    canvas = np.zeros((h, w, 3), dtype=np.uint8)
+    pts = [(int(x * w), int(y * h)) for x, y in landmarks]
+
+    for a, b in POSE_CONNECTIONS:
+        if a < len(pts) and b < len(pts):
+            cv2.line(canvas, pts[a], pts[b], (0, 255, 255), 2)
+
+    for p in pts:
+        cv2.circle(canvas, p, 4, (0, 255, 0), -1)
+
+    return canvas
 
 
-#   COACH CLASS
 class LiveCoach:
-    def __init__(self, model, cfg):
-        self.model = model
+    def __init__(self, cfg):
         self.cfg = cfg
         self.pose = PoseEstimator()
+        self.audio = AudioFeedback()
+        self.body_region = "lower" if cfg.primary_angle in LOWER_BODY_JOINTS else "upper"
 
-        # LOAD BASELINE
-        exercise_name = self.cfg.name.lower()
-        baseline_file = f"baselines/{exercise_name}_wait_baseline.json"
 
-        if not os.path.exists(baseline_file):
-            raise FileNotFoundError(f"[Coach] Baseline not found: {baseline_file}. Run trainer first.")
+        with open(f"baselines/{cfg.name}_model.json", "r") as f:
+            self.model = json.load(f)
 
-        with open(baseline_file, "r") as f:
-            baseline = json.load(f)
+        with open(f"baselines/{cfg.name}_motion.json", "r") as f:
+            self.avatar_motion = json.load(f)
 
-        # SMART KEYS
-        self.top_baseline = (
-            baseline.get("avg_top_wait_filtered_s") or
-            baseline.get("avg_top_wait_all_s") or
-            baseline.get("avg_top_wait_s") or
-            1.0
-        )
-        self.bottom_baseline = (
-            baseline.get("avg_bottom_wait_filtered_s") or
-            baseline.get("avg_bottom_wait_all_s") or
-            baseline.get("avg_bottom_wait_s") or
-            1.0
-        )
-
-        print(f"[Coach] Loaded baseline for {exercise_name}:")
-        print("   Top baseline:", self.top_baseline)
-        print("   Bottom baseline:", self.bottom_baseline)
-
-        # Precision thresholds
-        self.TOP_THRESHOLD = 140       # was 150 – more forgiving
-        self.BOTTOM_THRESHOLD = 100    # was 90 – more forgiving
-        self.TOL = 0.30                # ±30% hold tolerance
-
-        # State machine
-        self.state = "top"       # assume user starts standing/extended
-        self.last_transition_time = None
-        self.enter_top_t = None
-        self.enter_bottom_t = None
-
-        # Rep tracking
+        self.avatar_idx = 0
         self.rep_count = 0
-        self.rep_phase = "down"   # "down" → going bottom ; "up" → going top
-        self.rep_start_angle = None
+        self.last_feedback_text = ""
+        self.current_stage = "ready"
 
-        # Hold tracking for one rep
-        self.top_hold = 0
-        self.bottom_hold = 0
+        self.angle_history = deque(maxlen=20)
 
-        # Feedback
-        self.last_feedback = ""
+        # Yoga hold logic
+        self.hold_start_time = None
+        self.hold_completed = False
+        self.HOLD_DURATION = 3.0
 
+        # Rep quality tracking
+        self.rep_min_angle = None
+        self.rep_max_angle = None
+        self.rep_speed_samples = []
 
-    #   COMPUTE PRIMARY ANGLE
-    def get_angle(self, pts):
-        L_SHOULDER = 11; L_ELBOW = 13; L_WRIST = 15
-        L_HIP = 23; L_KNEE = 25; L_ANKLE = 27
-
-        if self.cfg.primary_angle == "left_knee":
-            return calc_angle(pts[L_HIP], pts[L_KNEE], pts[L_ANKLE])
-
-        if self.cfg.primary_angle == "left_elbow":
-            return calc_angle(pts[L_SHOULDER], pts[L_ELBOW], pts[L_WRIST])
-
-        return None
-
-
-    #   EVALUATE REP AND GIVE FEEDBACK
-    def evaluate_rep(self, rom, top_hold, bottom_hold, tempo):
-        feedback = []
-        score = 100
-
-        # ---------- ROM ----------
-        if rom < self.cfg.min_rom:
-            feedback.append("ROM too shallow")
-            score -= 35
+        # FSM
+        if cfg.type == "boxing":
+            self.fsm = BoxingFSM()
+        elif cfg.type == "yoga":
+            self.fsm = YogaFSM()
         else:
-            feedback.append("Good ROM")
+            stats = self.model["joints"][cfg.primary_angle]
+            self.fsm = SingleExerciseFSM(
+                stats["min"],
+                stats["max"],
+                cfg.min_rom
+            )
 
-        # ---------- TOP HOLD ----------
-        if top_hold < self.top_baseline * 0.7:
-            feedback.append("Top hold too short")
-            score -= 15
-        elif top_hold > self.top_baseline * 1.3:
-            feedback.append("Top hold too long")
-            score -= 10
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((HOST, PORT))
+        self.sock.listen(1)
+
+        print(f"[Coach] Listening on {HOST}:{PORT}")
+        self.conn, addr = self.sock.accept()
+        print(f"[Coach] Video sender connected from {addr}")
+
+        self.buffer = b""
+
+    def read_frame(self):
+        while len(self.buffer) < 4:
+            pkt = self.conn.recv(4096)
+            if not pkt:
+                return None
+            self.buffer += pkt
+
+        size = struct.unpack(">I", self.buffer[:4])[0]
+        self.buffer = self.buffer[4:]
+
+        while len(self.buffer) < size:
+            pkt = self.conn.recv(4096)
+            if not pkt:
+                return None
+            self.buffer += pkt
+
+        data = self.buffer[:size]
+        self.buffer = self.buffer[size:]
+
+        return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+    # -------- REP QUALITY EVALUATION --------
+    def evaluate_rep(self, stats):
+
+        rom_total = stats["max"] - stats["min"]
+        actual_rom = self.rep_max_angle - self.rep_min_angle
+
+        avg_speed = np.mean(self.rep_speed_samples) if self.rep_speed_samples else 0
+
+        # Normalize values
+        rom_ratio = actual_rom / rom_total if rom_total > 0 else 0
+
+        feedback_options = []
+
+        # ---------------- ROM QUALITY ----------------
+        if rom_ratio < 0.5:
+            feedback_options.append("Very shallow movement")
+        elif rom_ratio < 0.7:
+            feedback_options.append("Increase your range")
+        elif rom_ratio < 0.85:
+            feedback_options.append("Good depth, go slightly deeper")
         else:
-            feedback.append("Good top hold")
+            feedback_options.append("Excellent depth")
 
-        # ---------- BOTTOM HOLD ----------
-        if bottom_hold < self.bottom_baseline * 0.7:
-            feedback.append("Bottom hold too short")
-            score -= 15
-        elif bottom_hold > self.bottom_baseline * 1.3:
-            feedback.append("Bottom hold too long")
-            score -= 10
+        # ---------------- SPEED QUALITY ----------------
+        if avg_speed < 8:
+            feedback_options.append("Add more energy")
+        elif avg_speed < 20:
+            feedback_options.append("Good controlled pace")
+        elif avg_speed < 100:
+            feedback_options.append("Strong tempo")
+        elif avg_speed < 160:
+            feedback_options.append("Slow down slightly")
         else:
-            feedback.append("Good bottom hold")
+            feedback_options.append("Too fast, focus on control")
 
-        # ---------- TEMPO ----------
-        if tempo < 0.6:
-            feedback.append("Too fast")
-            score -= 20
-        elif tempo > 2.0:
-            feedback.append("Too slow")
-            score -= 10
+        # ---------------- BODY REGION TUNING ----------------
+        if self.body_region == "lower":
+            feedback_options.append("Keep your knees aligned")
         else:
-            feedback.append("Good tempo")
+            feedback_options.append("Control your upper body movement")
 
-        # Final judgment
-        if score >= 85:
-            summary = "Excellent rep!"
-        elif score >= 70:
-            summary = "Good rep."
-        else:
-            summary = "Poor rep — needs improvement."
+        # ---------------- FINAL SELECTION ----------------
+        # Pick 1 ROM + 1 SPEED randomly
+        selected = np.random.choice(feedback_options, size=2, replace=False)
 
-        self.last_feedback = summary + " | " + ", ".join(feedback)
+        return f"{selected[0]}. {selected[1]}"
 
 
-    #   MAIN COACH LOOP
+
+    # -------- MAIN LOOP --------
     def run(self):
-        client = SocketVideoClient()
-        client.connect()
 
-        print("Coaching started. Press 'q' to exit.")
+        primary_joint = self.cfg.primary_angle
+        stats = self.model["joints"][primary_joint]
+
+        prev_angle = None
+        rep_state = "top"
+
+        print("[Coach] Coaching started")
 
         while True:
-            frame = client.read_frame()
+            frame = self.read_frame()
             if frame is None:
-                break
+                continue
 
+            h, w, _ = frame.shape
+
+            avatar = draw_avatar_frame(
+                self.avatar_motion[self.avatar_idx], w, h
+            )
+            self.avatar_idx = (self.avatar_idx + 1) % len(self.avatar_motion)
+
+            user = frame.copy()
             pts = self.pose.process(frame)
-            overlay = frame.copy()
-            if pts:
-                self.pose.draw(overlay, pts)
 
             if not pts:
-                cv2.imshow("Coach", overlay)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
                 continue
 
-            # ---------------- ANGLE ----------------
-            angle = self.get_angle(pts)
-            if angle is None:
-                continue
+            self.pose.draw(user, pts)
 
-            t = time.time()
+            a, b, c = JOINTS[primary_joint]
+            angle = calculate_angle(pts[a], pts[b], pts[c])
 
-            is_top = angle > self.TOP_THRESHOLD
-            is_bottom = angle < self.BOTTOM_THRESHOLD
+            speed = 0
+            if prev_angle is not None:
+                speed = abs(angle - prev_angle) * FPS
+                self.rep_speed_samples.append(speed)
 
+            prev_angle = angle
 
-            # ---------------- ON TOP ----------------
-            if is_top:
-                if self.state != "top":
-                    # leaving bottom → measure bottom hold
-                    if self.state == "bottom" and self.enter_bottom_t:
-                        self.bottom_hold = t - self.enter_bottom_t
+            # Track min/max per rep
+            if self.rep_min_angle is None:
+                self.rep_min_angle = angle
+                self.rep_max_angle = angle
 
-                    # if we were rising up from bottom → rep complete
-                    if self.rep_phase == "up":
+            self.rep_min_angle = min(self.rep_min_angle, angle)
+            self.rep_max_angle = max(self.rep_max_angle, angle)
+
+            # ---------------- YOGA LOGIC ----------------
+            if self.cfg.type == "yoga":
+
+                self.angle_history.append(angle)
+
+                # Only compute STD when enough samples
+                if len(self.angle_history) >= 5:
+                    angle_std = np.std(self.angle_history)
+                else:
+                    angle_std = 999  # force unstable until enough data
+
+                stable_threshold = self.fsm.STABLE_STD
+
+                # Display STD
+                cv2.putText(user,
+                            f"STD: {round(angle_std,2)}",
+                            (20, 140),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0,255,255),
+                            2)
+
+                # STRICT STABILITY CHECK
+                if angle_std < stable_threshold:
+
+                    if self.hold_start_time is None:
+                        self.hold_start_time = time.time()
+                        self.hold_completed = False   # ensure new hold
+
+                    hold_time = time.time() - self.hold_start_time
+
+                    cv2.putText(user,
+                                f"HOLD: {round(hold_time,1)}s",
+                                (20, 170),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.8,
+                                (0,255,0),
+                                2)
+
+                    # Count rep once per hold
+                    if hold_time >= self.HOLD_DURATION and not self.hold_completed:
                         self.rep_count += 1
-                        rom = abs(self.rep_start_angle - angle)
-                        tempo = t - (self.last_transition_time or t)
 
-                        self.evaluate_rep(
-                            rom=rom,
-                            top_hold=self.top_hold,
-                            bottom_hold=self.bottom_hold,
-                            tempo=tempo
-                        )
+                        feedback = f"Good hold rep {self.rep_count}"
+                        self.audio.speak(feedback)
+                        self.last_feedback_text = feedback
 
-                    # reset for next rep
-                    self.rep_phase = "down"
-                    self.rep_start_angle = angle
-                    self.state = "top"
-                    self.enter_top_t = t
-                    self.last_transition_time = t
+                        self.hold_completed = True
 
-            # ---------------- ON BOTTOM ----------------
-            elif is_bottom:
-                if self.state != "bottom":
-                    # leaving top → measure top hold
-                    if self.state == "top" and self.enter_top_t:
-                        self.top_hold = t - self.enter_top_t
+                else:
+                    # Instability → reset EVERYTHING
+                    self.hold_start_time = None
+                    self.hold_completed = False
 
-                    self.state = "bottom"
-                    self.enter_bottom_t = t
-                    self.last_transition_time = t
-                    self.rep_phase = "up"
-
-            # ---------------- MIDDLE ----------------
+            # ---------------- SINGLE / BOXING ----------------
             else:
-                self.state = "middle"
 
-            #   DISPLAY OVERLAYS
-            cv2.putText(overlay, f"Angle: {int(angle)}°", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+                if angle < stats["min"] + 10 and rep_state == "top":
+                    rep_state = "bottom"
 
-            cv2.putText(overlay, f"Reps: {self.rep_count}", (20, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,0), 2)
+                elif angle > stats["max"] - 10 and rep_state == "bottom":
 
-            if self.last_feedback:
-                cv2.putText(overlay, self.last_feedback, (20, 130),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                    rep_state = "top"
+                    self.rep_count += 1
 
-            cv2.imshow("Coach", overlay)
+                    feedback = f"{self.evaluate_rep(stats)} rep {self.rep_count}"
+
+
+                    self.audio.speak(feedback)
+                    self.last_feedback_text = feedback
+
+                    # Reset tracking
+                    self.rep_min_angle = None
+                    self.rep_max_angle = None
+                    self.rep_speed_samples = []
+
+                    # Determine body region for feedback tuning
+                    LOWER_BODY_JOINTS = ["left_knee", "right_knee"]
+                    if self.cfg.primary_angle in LOWER_BODY_JOINTS:
+
+                        self.body_region = "lower"
+                    else:
+                        self.body_region = "upper"
+
+
+            cv2.putText(user, f"REPS: {self.rep_count}",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
+                        1, (0,255,0), 3)
+
+            cv2.putText(user, f"FEEDBACK: {self.last_feedback_text}",
+                        (20, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0,0,255), 2)
+
+            combined = np.hstack([avatar, user])
+            cv2.imshow("AI Exercise Coach", combined)
+
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
         cv2.destroyAllWindows()
+        self.conn.close()
