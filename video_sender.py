@@ -1,3 +1,17 @@
+# =============================================================================
+# Copyright (c) 2024 Abdullah (GitHub: Abdullahtss)
+# All Rights Reserved.
+#
+# PROPRIETARY AND CONFIDENTIAL
+# This file is part of the AI Avatar Exercise Correction System.
+#
+# UNAUTHORIZED COPYING, MODIFICATION, DISTRIBUTION, OR USE OF THIS FILE,
+# VIA ANY MEDIUM, IS STRICTLY PROHIBITED WITHOUT PRIOR WRITTEN PERMISSION
+# FROM THE AUTHOR. Submitting this code as your own work constitutes
+# plagiarism and may result in academic and/or legal consequences.
+#
+# For permissions: https://github.com/Abdullahtss
+# =============================================================================
 import socket
 import struct
 import cv2
